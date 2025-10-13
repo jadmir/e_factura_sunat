@@ -51,43 +51,56 @@ app.get("/", (req, res) => {
   `);
 });
 
-// Ruta para subir PDF y generar QR con URL ficticia
+// 📌 Ruta para visualizar PDF desde el QR
+app.get("/view/:id", (req, res) => {
+  const fileId = req.params.id;
+  const pdfPath = path.join(uploadDir, fileId);
+
+  if (!fs.existsSync(pdfPath)) {
+    return res.status(404).send("<h2>❌ PDF no encontrado</h2>");
+  }
+
+  // Mostrar vista previa del PDF
+  res.send(`
+    <div style="text-align:center; font-family:Arial, sans-serif;">
+      <iframe src="/files/${fileId}" width="90%" height="600px" style="border:1px solid #ccc; border-radius:8px;"></iframe>
+    </div>
+  `);
+});
+
+// Ruta para subir PDF y generar QR
 app.post("/upload", upload.single("pdf"), async (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send("No se subió ningún archivo.");
 
-  // Crear URL ficticia tipo SUNAT
-  const randomToken = nanoid(60);
-  const fakeUrl = `https://e-factura.sunart.gop.pe/v1/contribuyante/gre/comprobantes/descargass?${randomToken}`;
+  // ✅ URL real de tu servidor (Render o local)
+  const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  const viewUrl = `${serverUrl}/view/${file.filename}`;
 
-  // Generar QR en PNG
+  // Generar QR con URL real
   const qrPath = path.join(uploadDir, `${file.filename}-qr.png`);
-  await QRCode.toFile(qrPath, fakeUrl, {
+  await QRCode.toFile(qrPath, viewUrl, {
     type: "png",
     width: 300,
     margin: 2,
   });
 
-  // Vista previa del QR + botón de descarga y opción de subir otro PDF
+  // Vista previa del QR + botón de descarga y subir otro PDF
   res.send(`
     <div style="text-align:center; font-family: Arial, sans-serif; margin: 40px;">
       <h2>✅ Archivo subido correctamente</h2>
-      <p>
-        <a href="/" style="display:inline-block; background:#28a745; color:white; text-decoration:none; padding:10px 16px; border-radius:6px;">
-          ➕ Subir otro PDF
-        </a>
-      </p>
       <p><strong>Archivo:</strong> ${file.originalname}</p>
-      <p><strong>URL Ficticia:</strong> <a href="${fakeUrl}" target="_blank">${fakeUrl}</a></p>
+      <p><strong>URL del documento:</strong> <a href="${viewUrl}" target="_blank">${viewUrl}</a></p>
 
       <h3>Vista previa del QR</h3>
-      <img src="/files/${file.filename}-qr.png" alt="QR Code" width="300" style="border:1px solid #ccc; padding:10px; border-radius:10px"/><br/><br/>
+      <img src="/files/${file.filename}-qr.png" alt="QR Code" width="300"
+        style="border:1px solid #ccc; padding:10px; border-radius:10px"/><br/><br/>
 
       <a href="/files/${file.filename}-qr.png" download="qr-${file.originalname}.png">
         ⬇️ Descargar QR (PNG)
       </a><br/><br/>
 
-      <p>El PDF está disponible en: <a href="/files/${file.filename}" target="_blank">Ver PDF</a></p>
+      <p>El PDF está disponible en: <a href="${viewUrl}" target="_blank">Ver PDF</a></p>
 
       <br/>
       <a href="/" style="display:inline-block; background:#28a745; color:white; text-decoration:none; padding:10px 16px; border-radius:6px;">
@@ -97,7 +110,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
   `);
 });
 
-// Si alguien intenta entrar por GET a /upload (por ejemplo al recargar), lo mandamos al formulario
+// Evitar error al recargar /upload
 app.get("/upload", (req, res) => res.redirect("/"));
 
 // Iniciar servidor
