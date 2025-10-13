@@ -107,26 +107,23 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
   `);
 });
 
-// ✅ Ruta para ver PDF por token
+// ✅ Ruta para abrir directamente el PDF (sin HTML)
 app.get("/view/:token", (req, res) => {
   const token = req.params.token;
   const tokens = JSON.parse(fs.readFileSync(metaFile, "utf8"));
 
   const fileName = tokens[token];
   if (!fileName) {
-    return res.status(404).send("<h2>❌ Token inválido o PDF no encontrado</h2>");
+    return res.status(404).send("❌ Token inválido o PDF no encontrado.");
   }
 
   const pdfPath = path.join(uploadDir, fileName);
   if (!fs.existsSync(pdfPath)) {
-    return res.status(404).send("<h2>❌ El archivo PDF ya no existe</h2>");
+    return res.status(404).send("❌ El archivo PDF ya no existe.");
   }
 
-  res.send(`
-    <div style="text-align:center; font-family:Arial, sans-serif;">
-      <iframe src="/files/${fileName}" width="90%" height="600px" style="border:1px solid #ccc; border-radius:8px;"></iframe>
-    </div>
-  `);
+  // ✅ Abrir directamente el PDF en el navegador
+  res.sendFile(pdfPath);
 });
 
 // Evitar error al recargar /upload
