@@ -22,8 +22,10 @@ const PURGE_INTERVAL_MINUTES = Number(process.env.PURGE_INTERVAL_MINUTES || 360)
 // Detrás de proxy (Heroku/Render/Nginx), confía en X-Forwarded-*
 app.set("trust proxy", 1);
 
-// Carpeta para guardar PDFs y metadatos
-const uploadDir = path.join(__dirname, "uploads");
+// Carpeta para guardar PDFs y metadatos (configurable por env)
+const uploadDir = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 // Archivo único de metadatos persistentes

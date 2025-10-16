@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: sistema-pdf
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    runtime: node
+    nodeVersion: 20
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TOKEN_TTL_DAYS
+        value: 365
+      - key: MAX_FILE_MB
+        value: 10
+      - key: PURGE_INTERVAL_MINUTES
+        value: 360
+      - key: UPLOAD_DIR
+        value: /data/uploads
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
