@@ -356,17 +356,66 @@ app.get("/view/:token", async (req, res) => {
 // QR desde S3 (URL prefirmada) para vista/descarga
 app.get("/qr/:token", async (req, res) => {
   const token = req.params.token;
-  const meta = readMetadata();
-  const entry = meta.byToken[token];
-  if (!entry || !entry.qrS3Key || !entry.s3Bucket) return res.status(404).send("QR no encontrado");
-  const url = await getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: entry.s3Bucket, Key: entry.qrS3Key }),
-    { expiresIn: 300 }
-  );
-  if (req.query.download) res.setHeader("Content-Disposition", `attachment; filename=qr-${encodeURIComponent(entry.originalName || entry.filename)}.png`);
-  res.setHeader("Cache-Control", "no-store");
-  return res.redirect(url);
+  // Cargar desde S3 o fallback local
+  let entry = await s3GetJson(`${TOKENS_PREFIX}/${token}.json`);
+  if (!entry) {
+    const meta = readMetadata();
+    entry = meta.byToken[token];
+  }
+  if (!entry) return res.status(404).send("QR no encontrado");
+
+  const bucket = entry.s3Bucket || AWS_S3_BUCKET;
+  // Derivar clave del QR si falta
+  let qrKey = entry.qrS3Key;
+  if (!qrKey) {
+    if (entry.s3Key) qrKey = `${entry.s3Key}-qr.png`;
+    else if (entry.filename) qrKey = `${AWS_S3_PREFIX}/${entry.filename}-qr.png`;
+  }
+  if (!bucket || !qrKey) return res.status(404).send("QR no encontrado");
+
+  // Intenta firmar; si no existe, generar y subir QR al vuelo
+  try {
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: bucket, Key: qrKey }),
+      { expiresIn: 300 }
+    );
+    if (req.query.download) res.setHeader("Content-Disposition", `attachment; filename=qr-${encodeURIComponent(entry.originalName || entry.filename)}.png`);
+    res.setHeader("Cache-Control", "no-store");
+    return res.redirect(url);
+  } catch (e) {
+    try {
+      // Generar y subir QR si no está
+      const viewUrl = `${getBaseUrl(req)}/view/${token}`;
+      const qrBuffer = await QRCode.toBuffer(viewUrl, { type: 'png', width: 300, margin: 2 });
+      await s3.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: qrKey,
+        Body: qrBuffer,
+        ContentType: 'image/png',
+        CacheControl: 'public, max-age=31536000, immutable',
+      }));
+      // Actualizar metadatos en S3 y local
+      entry.qrS3Key = qrKey;
+      await s3PutJson(`${TOKENS_PREFIX}/${token}.json`, { ...entry, token });
+      const meta = readMetadata();
+      if (entry.filename) {
+        meta.byFile[entry.filename] = { ...(meta.byFile[entry.filename] || {}), ...entry };
+      }
+      meta.byToken[token] = { ...(meta.byToken[token] || {}), ...entry };
+      writeMetadata(meta);
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: bucket, Key: qrKey }),
+        { expiresIn: 300 }
+      );
+      if (req.query.download) res.setHeader("Content-Disposition", `attachment; filename=qr-${encodeURIComponent(entry.originalName || entry.filename)}.png`);
+      res.setHeader("Cache-Control", "no-store");
+      return res.redirect(url);
+    } catch (e2) {
+      return res.status(404).send("QR no encontrado");
+    }
+  }
 });
 
 // Listado simple de tokens guardados
