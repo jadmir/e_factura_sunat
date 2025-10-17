@@ -65,6 +65,54 @@ const writeMetadata = (data) => {
   fs.writeFileSync(metadataPath, JSON.stringify(safe, null, 2), "utf8");
 };
 
+// --- Helpers S3 para metadatos de tokens ---
+const TOKENS_PREFIX = (process.env.AWS_TOKENS_PREFIX || `tokens`).replace(/^\/+|\/+$/g, "");
+async function s3PutJson(key, obj) {
+  if (!AWS_S3_BUCKET) return;
+  const body = Buffer.from(JSON.stringify(obj));
+  await s3.send(new PutObjectCommand({
+    Bucket: AWS_S3_BUCKET,
+    Key: key,
+    Body: body,
+    ContentType: "application/json",
+    CacheControl: "no-store",
+  }));
+}
+async function s3GetJson(key) {
+  if (!AWS_S3_BUCKET) return null;
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+    const buf = await out.Body.transformToByteArray();
+    return JSON.parse(Buffer.from(buf).toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+async function s3ListTokenEntries(limit = 200) {
+  if (!AWS_S3_BUCKET) return [];
+  const { ListObjectsV2Command } = await import("@aws-sdk/client-s3");
+  let tokenEntries = [];
+  let ContinuationToken;
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: AWS_S3_BUCKET,
+      Prefix: `${TOKENS_PREFIX}/`,
+      ContinuationToken,
+      MaxKeys: Math.min(1000, limit - tokenEntries.length),
+    }));
+    const keys = (resp.Contents || [])
+      .filter(o => o.Key && o.Key.endsWith('.json'))
+      .map(o => o.Key);
+    for (const k of keys) {
+      const e = await s3GetJson(k);
+      if (e) tokenEntries.push(e);
+      if (tokenEntries.length >= limit) break;
+    }
+    ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (ContinuationToken && tokenEntries.length < limit);
+  return tokenEntries;
+}
+
 // Utilidad para construir URL pública correcta
 function getBaseUrl(req) {
   if (BASE_URL) return BASE_URL.replace(/\/$/, "");
@@ -97,7 +145,11 @@ const safeJoin = (base, file) => {
 };
 const removeByToken = async (token) => {
   const meta = readMetadata();
-  const entry = meta.byToken[token];
+  let entry = meta.byToken[token];
+  if (!entry) {
+    // intenta cargar desde S3 si no está en memoria local
+    entry = await s3GetJson(`${TOKENS_PREFIX}/${token}.json`);
+  }
   if (!entry) return { ok: false, reason: "not_found" };
 
   // Eliminar en S3 si existe
@@ -110,6 +162,8 @@ const removeByToken = async (token) => {
   delete meta.byToken[token];
   delete meta.byFile[entry.filename];
   writeMetadata(meta);
+  // Borrar metadato de token en S3
+  try { await s3.send(new DeleteObjectCommand({ Bucket: AWS_S3_BUCKET, Key: `${TOKENS_PREFIX}/${token}.json` })); } catch {}
   return { ok: true, entry };
 };
 
@@ -203,7 +257,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
     ContentType: file.mimetype || "application/pdf",
   }));
 
-  meta.byFile[uniqueName] = {
+  const entry = {
     token,
     originalName: file.originalname,
     size: file.size,
@@ -212,18 +266,13 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
       expiresAt: expiresAt ? expiresAt.toISOString() : null,
     s3Bucket: AWS_S3_BUCKET,
     s3Key,
-  };
-  meta.byToken[token] = {
     filename: uniqueName,
-    originalName: file.originalname,
-    size: file.size,
-    mime: file.mimetype,
-    createdAt: createdAt.toISOString(),
-      expiresAt: expiresAt ? expiresAt.toISOString() : null,
-    s3Bucket: AWS_S3_BUCKET,
-    s3Key,
   };
+  // Persistir local (fallback) y en S3 por token
+  meta.byFile[uniqueName] = { ...entry };
+  meta.byToken[token] = { ...entry };
   writeMetadata(meta);
+  await s3PutJson(`${TOKENS_PREFIX}/${token}.json`, { ...entry, token });
 
   const viewUrl = `${getBaseUrl(req)}/view/${token}`;
 
@@ -240,6 +289,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
   meta.byFile[uniqueName].qrS3Key = qrS3Key;
   meta.byToken[token].qrS3Key = qrS3Key;
   writeMetadata(meta);
+  await s3PutJson(`${TOKENS_PREFIX}/${token}.json`, { ...entry, qrS3Key, token });
 
   // Respuesta visual
   res.send(`
@@ -268,8 +318,11 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
 // ✅ Ruta protegida por token y expiración: envía el PDF si el token sigue vigente
 app.get("/view/:token", async (req, res) => {
   const token = req.params.token;
-  const meta = readMetadata();
-  const entry = meta.byToken[token];
+  let entry = await s3GetJson(`${TOKENS_PREFIX}/${token}.json`);
+  if (!entry) {
+    const meta = readMetadata();
+    entry = meta.byToken[token];
+  }
   if (!entry) return res.status(404).send("❌ Token inválido o PDF no encontrado.");
 
   const now = Date.now();
@@ -317,29 +370,42 @@ app.get("/qr/:token", async (req, res) => {
 });
 
 // Listado simple de tokens guardados
-app.get("/tokens", (req, res) => {
+app.get("/tokens", async (req, res) => {
   if (ADMIN_USER && ADMIN_PASS) return requireAdmin(req, res, () => listTokens(req, res));
   return listTokens(req, res);
 });
 
-function listTokens(req, res) {
+async function listTokens(req, res) {
+  // Obtén entradas desde S3 y completa con locales si faltan
+  const s3Entries = await s3ListTokenEntries(500);
+  const byToken = new Map();
+  for (const e of s3Entries || []) {
+    if (e && e.token) byToken.set(e.token, e);
+  }
   const meta = readMetadata();
-  const rows = Object.entries(meta.byToken)
-    .map(([t, info]) => {
-    const expired = info.expiresAt && Date.now() > Date.parse(info.expiresAt);
-    const qrRoute = `/qr/${t}`;
-    const expText = info.expiresAt ? new Date(info.expiresAt).toLocaleString() : 'Sin vencimiento';
+  for (const [tok, info] of Object.entries(meta.byToken || {})) {
+    if (!byToken.has(tok)) byToken.set(tok, { ...info, token: tok });
+  }
+  const combined = Array.from(byToken.values()).sort((a, b) => {
+    return Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0);
+  });
+  const rows = combined
+    .map((info) => {
+      const token = info.token;
+      const expired = info.expiresAt && Date.now() > Date.parse(info.expiresAt);
+      const qrRoute = `/qr/${token}`;
+      const expText = info.expiresAt ? new Date(info.expiresAt).toLocaleString() : 'Sin vencimiento';
       return `
         <tr>
-          <td><code>${t}</code></td>
+          <td><code>${token}</code></td>
           <td>${info.originalName || "-"}</td>
           <td><code>${info.filename}</code></td>
           <td>${info.createdAt || "-"}</td>
-      <td>${expText} ${expired ? "(vencido)" : ""}</td>
+          <td>${expText} ${expired ? "(vencido)" : ""}</td>
           <td>
-            <a href="/view/${t}" target="_blank">Ver PDF</a> |
+            <a href="/view/${token}" target="_blank">Ver PDF</a> |
             <a href="${qrRoute}" target="_blank">Ver QR</a> |
-            <a href="/delete/${encodeURIComponent(t)}" style="color:#dc3545" onclick="return confirm('¿Eliminar este PDF y su QR?');">Eliminar</a>
+            <a href="/delete/${encodeURIComponent(token)}" style="color:#dc3545" onclick="return confirm('¿Eliminar este PDF y su QR?');">Eliminar</a>
           </td>
         </tr>`;
     })
@@ -381,6 +447,7 @@ async function purgeExpired() {
   try { fs.unlinkSync(path.join(uploadDir, `${info.filename}-qr.png`)); } catch {}
       delete meta.byFile[info.filename];
       delete meta.byToken[token];
+  try { await s3.send(new DeleteObjectCommand({ Bucket: AWS_S3_BUCKET, Key: `${TOKENS_PREFIX}/${token}.json` })); } catch {}
       removed++;
     }
   }
@@ -392,6 +459,88 @@ async function purgeExpired() {
 app.get("/admin/purge", requireAdmin, async (req, res) => {
   const removed = await purgeExpired();
   res.send(`Eliminados ${removed} elementos vencidos. <a href=\"/manage\">Volver</a>`);
+});
+
+// Reindexar: crear tokens/*.json para PDFs que ya existen en S3 y no tienen metadatos
+app.get("/admin/reindex", requireAdmin, async (req, res) => {
+  if (!AWS_S3_BUCKET) return res.status(500).send("Falta AWS_S3_BUCKET");
+  const { ListObjectsV2Command } = await import("@aws-sdk/client-s3");
+  // 1) Traer lista actual de tokens desde S3
+  const existingEntries = await s3ListTokenEntries(1000);
+  const byFilename = new Map();
+  const byToken = new Map();
+  for (const e of existingEntries) {
+    if (e?.filename) byFilename.set(e.filename, e);
+    if (e?.token) byToken.set(e.token, e);
+  }
+  // 2) Traer lista de objetos bajo uploads/
+  const allKeys = new Set();
+  let ContinuationToken;
+  let pdfKeys = [];
+  do {
+    const out = await s3.send(new ListObjectsV2Command({
+      Bucket: AWS_S3_BUCKET,
+      Prefix: `${AWS_S3_PREFIX}/`,
+      ContinuationToken,
+      MaxKeys: 1000,
+    }));
+    for (const obj of out.Contents || []) {
+      if (obj.Key) allKeys.add(obj.Key);
+      if (obj.Key && obj.Key.endsWith('.pdf')) pdfKeys.push(obj.Key);
+    }
+    ContinuationToken = out.IsTruncated ? out.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+
+  const meta = readMetadata();
+  let created = 0;
+  let qrCreated = 0;
+  for (const s3Key of pdfKeys) {
+    const filename = s3Key.split('/').pop();
+    let entry = byFilename.get(filename);
+
+    if (!entry) {
+      // Intenta usar local si existe
+      const local = meta.byFile[filename];
+      const token = local?.token || nanoid(60);
+      const ttlDays = Number(TOKEN_TTL_DAYS);
+      const createdAt = new Date();
+      const expiresAt = ttlDays > 0 ? new Date(createdAt.getTime() + ttlDays * 24 * 60 * 60 * 1000) : null;
+      const qrS3Key = `${AWS_S3_PREFIX}/${filename}-qr.png`;
+      entry = {
+        token,
+        filename,
+        originalName: local?.originalName || filename,
+        size: local?.size,
+        mime: local?.mime || 'application/pdf',
+        createdAt: local?.createdAt || createdAt.toISOString(),
+        expiresAt: local?.expiresAt || (expiresAt ? expiresAt.toISOString() : null),
+        s3Bucket: AWS_S3_BUCKET,
+        s3Key,
+        qrS3Key,
+      };
+      // Persistir en S3 y local
+      await s3PutJson(`${TOKENS_PREFIX}/${token}.json`, entry);
+      meta.byFile[filename] = { ...entry };
+      meta.byToken[token] = { ...entry };
+      created++;
+    }
+
+    // Generar QR si falta
+    if (entry.qrS3Key && !allKeys.has(entry.qrS3Key)) {
+      const viewUrl = `${getBaseUrl(req)}/view/${entry.token}`;
+      const qrBuffer = await QRCode.toBuffer(viewUrl, { type: 'png', width: 300, margin: 2 });
+      await s3.send(new PutObjectCommand({
+        Bucket: AWS_S3_BUCKET,
+        Key: entry.qrS3Key,
+        Body: qrBuffer,
+        ContentType: 'image/png',
+        CacheControl: 'public, max-age=31536000, immutable',
+      }));
+      qrCreated++;
+    }
+  }
+  writeMetadata(meta);
+  res.send(`Reindex listo. Tokens creados: ${created}. QRs creados: ${qrCreated}. <a href="/tokens">Ver tokens</a>`);
 });
 
 // Health check
@@ -410,13 +559,18 @@ purgeExpired().then((removed) => {
 
 
 // Página de administración con lista sencilla y opción de eliminar
-app.get("/manage", requireAdmin, (req, res) => {
+app.get("/manage", requireAdmin, async (req, res) => {
+  const s3Entries = await s3ListTokenEntries(500);
+  const byToken = new Map();
+  for (const e of s3Entries || []) if (e && e.token) byToken.set(e.token, e);
   const meta = readMetadata();
-  const items = Object.entries(meta.byToken)
-    .sort((a, b) => Date.parse(b[1].createdAt) - Date.parse(a[1].createdAt))
-    .map(([t, info]) => {
-  const created = new Date(info.createdAt).toLocaleString();
-  const sizeStr = info.size ? ` (${(info.size/1024).toFixed(1)} KB)` : "";
+  for (const [tok, info] of Object.entries(meta.byToken || {})) if (!byToken.has(tok)) byToken.set(tok, { ...info, token: tok });
+  const combined = Array.from(byToken.values()).sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+  const items = combined
+    .map((info) => {
+      const t = info.token;
+      const created = new Date(info.createdAt).toLocaleString();
+      const sizeStr = info.size ? ` (${(info.size/1024).toFixed(1)} KB)` : "";
       return `
         <tr>
           <td>${info.originalName || info.filename}</td>
