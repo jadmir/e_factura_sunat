@@ -1,0 +1,17 @@
+# Node
+node_modules/
+.nyc_output/
+coverage/
+
+# Env
+.env
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Uploads (si usas local)
+uploads/*.pdf
+uploads/*.png
+uploads/metadata.json

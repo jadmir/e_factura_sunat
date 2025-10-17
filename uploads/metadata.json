@@ -1,4 +1,50 @@
 {
-  "byFile": {},
-  "byToken": {}
+  "byFile": {
+    "1760664746391-20125942831-09-T002-00005760 (1).pdf": {
+      "token": "R-aGflmF1t5ONDa7AkMLn7qNyRWNxipnlEtkhTFPyg0HQ8myNIbQAWG5m_rN",
+      "originalName": "20125942831-09-T002-00005760 (1).pdf",
+      "size": 75283,
+      "mime": "application/pdf",
+      "createdAt": "2025-10-17T01:32:26.391Z",
+      "expiresAt": "2026-10-17T01:32:26.391Z",
+      "s3Bucket": "mis-pdfs-proyecto",
+      "s3Key": "uploads/1760664746391-20125942831-09-T002-00005760 (1).pdf",
+      "qrS3Key": "uploads/1760664746391-20125942831-09-T002-00005760 (1).pdf-qr.png"
+    },
+    "1760665217877-20125942831-09-T002-00005760.pdf": {
+      "token": "5Sz6DQvGvXSDV_YXdAwsK-c7M2_3p_AjHOgXA1ZlTvBHPfe1HmmIqcsLoSCq",
+      "originalName": "20125942831-09-T002-00005760.pdf",
+      "size": 73395,
+      "mime": "application/pdf",
+      "createdAt": "2025-10-17T01:40:17.877Z",
+      "expiresAt": "2026-10-17T01:40:17.877Z",
+      "s3Bucket": "mis-pdfs-proyecto",
+      "s3Key": "uploads/1760665217877-20125942831-09-T002-00005760.pdf",
+      "qrS3Key": "uploads/1760665217877-20125942831-09-T002-00005760.pdf-qr.png"
+    }
+  },
+  "byToken": {
+    "R-aGflmF1t5ONDa7AkMLn7qNyRWNxipnlEtkhTFPyg0HQ8myNIbQAWG5m_rN": {
+      "filename": "1760664746391-20125942831-09-T002-00005760 (1).pdf",
+      "originalName": "20125942831-09-T002-00005760 (1).pdf",
+      "size": 75283,
+      "mime": "application/pdf",
+      "createdAt": "2025-10-17T01:32:26.391Z",
+      "expiresAt": "2026-10-17T01:32:26.391Z",
+      "s3Bucket": "mis-pdfs-proyecto",
+      "s3Key": "uploads/1760664746391-20125942831-09-T002-00005760 (1).pdf",
+      "qrS3Key": "uploads/1760664746391-20125942831-09-T002-00005760 (1).pdf-qr.png"
+    },
+    "5Sz6DQvGvXSDV_YXdAwsK-c7M2_3p_AjHOgXA1ZlTvBHPfe1HmmIqcsLoSCq": {
+      "filename": "1760665217877-20125942831-09-T002-00005760.pdf",
+      "originalName": "20125942831-09-T002-00005760.pdf",
+      "size": 73395,
+      "mime": "application/pdf",
+      "createdAt": "2025-10-17T01:40:17.877Z",
+      "expiresAt": "2026-10-17T01:40:17.877Z",
+      "s3Bucket": "mis-pdfs-proyecto",
+      "s3Key": "uploads/1760665217877-20125942831-09-T002-00005760.pdf",
+      "qrS3Key": "uploads/1760665217877-20125942831-09-T002-00005760.pdf-qr.png"
+    }
+  }
 }

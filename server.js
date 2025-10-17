@@ -5,6 +5,12 @@ import path from "path";
 import fs from "fs";
 import { nanoid } from "nanoid";
 import { fileURLToPath } from "url";
+import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import dotenv from "dotenv";
+
+// Cargar variables de entorno desde .env si existe
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,6 +24,12 @@ const ADMIN_USER = process.env.ADMIN_USER || "";
 const ADMIN_PASS = process.env.ADMIN_PASS || "";
 const BASE_URL = process.env.BASE_URL || ""; // opcional para enlaces externos
 const PURGE_INTERVAL_MINUTES = Number(process.env.PURGE_INTERVAL_MINUTES || 360); // 6h
+const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+const AWS_S3_BUCKET = process.env.AWS_S3_BUCKET || process.env.AWS_BUCKET_NAME || "";
+const AWS_S3_PREFIX = (process.env.AWS_S3_PREFIX || "uploads").replace(/^\/+|\/+$/g, "");
+
+// Cliente S3
+const s3 = new S3Client({ region: AWS_REGION });
 
 // Detrás de proxy (Heroku/Render/Nginx), confía en X-Forwarded-*
 app.set("trust proxy", 1);
@@ -83,19 +95,17 @@ const safeJoin = (base, file) => {
   if (!p.startsWith(base)) throw new Error("Ruta no permitida");
   return p;
 };
-const removeByToken = (token) => {
+const removeByToken = async (token) => {
   const meta = readMetadata();
   const entry = meta.byToken[token];
   if (!entry) return { ok: false, reason: "not_found" };
 
-  try {
-    const pdfPath = safeJoin(uploadDir, entry.filename);
-    const qrPath = safeJoin(uploadDir, `${entry.filename}-qr.png`);
-    if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
-    if (fs.existsSync(qrPath)) fs.unlinkSync(qrPath);
-  } catch (e) {
-    // continúa igualmente para limpiar metadatos
-  }
+  // Eliminar en S3 si existe
+  try { if (entry.s3Bucket && entry.s3Key) await s3.send(new DeleteObjectCommand({ Bucket: entry.s3Bucket, Key: entry.s3Key })); } catch {}
+  try { if (entry.s3Bucket && entry.qrS3Key) await s3.send(new DeleteObjectCommand({ Bucket: entry.s3Bucket, Key: entry.qrS3Key })); } catch {}
+  // Intentar también localmente (modo desarrollo)
+  try { const pdfPath = safeJoin(uploadDir, entry.filename); if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
+  try { const qrPath = safeJoin(uploadDir, `${entry.filename}-qr.png`); if (fs.existsSync(qrPath)) fs.unlinkSync(qrPath); } catch {}
 
   delete meta.byToken[token];
   delete meta.byFile[entry.filename];
@@ -103,14 +113,8 @@ const removeByToken = (token) => {
   return { ok: true, entry };
 };
 
-// Configuración de Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
-    cb(null, uniqueName);
-  },
-});
+// Configuración de Multer (memoria). file.buffer contendrá el PDF
+const storage = multer.memoryStorage();
 
 // Servir archivos subidos
 // Servir archivos subidos con control de caché (QR puede cachearse largo)
@@ -179,37 +183,63 @@ app.get("/upload", (req, res) => res.redirect("/"));
 app.post("/upload", upload.single("pdf"), async (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send("No se subió ningún archivo.");
+  if (!AWS_S3_BUCKET) return res.status(500).send("Falta configurar AWS_S3_BUCKET.");
 
   const meta = readMetadata();
   const token = nanoid(60);
   const createdAt = new Date();
-  const expiresAt = new Date(
-    createdAt.getTime() + TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000
-  );
+    const ttlDays = Number(TOKEN_TTL_DAYS);
+    const expiresAt = ttlDays > 0
+      ? new Date(createdAt.getTime() + ttlDays * 24 * 60 * 60 * 1000)
+      : null; // sin vencimiento si <= 0
 
-  meta.byFile[file.filename] = {
+  // Crear nombre único y subir a S3
+  const uniqueName = `${Date.now()}-${file.originalname}`;
+  const s3Key = `${AWS_S3_PREFIX}/${uniqueName}`;
+  await s3.send(new PutObjectCommand({
+    Bucket: AWS_S3_BUCKET,
+    Key: s3Key,
+    Body: file.buffer,
+    ContentType: file.mimetype || "application/pdf",
+  }));
+
+  meta.byFile[uniqueName] = {
     token,
     originalName: file.originalname,
     size: file.size,
     mime: file.mimetype,
     createdAt: createdAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+    s3Bucket: AWS_S3_BUCKET,
+    s3Key,
   };
   meta.byToken[token] = {
-    filename: file.filename,
+    filename: uniqueName,
     originalName: file.originalname,
     size: file.size,
     mime: file.mimetype,
     createdAt: createdAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+    s3Bucket: AWS_S3_BUCKET,
+    s3Key,
   };
   writeMetadata(meta);
 
   const viewUrl = `${getBaseUrl(req)}/view/${token}`;
 
-  // Generar QR en PNG
-  const qrPath = path.join(uploadDir, `${file.filename}-qr.png`);
-  await QRCode.toFile(qrPath, viewUrl, { type: "png", width: 300, margin: 2 });
+  // Generar QR a buffer y subir a S3
+  const qrBuffer = await QRCode.toBuffer(viewUrl, { type: "png", width: 300, margin: 2 });
+  const qrS3Key = `${AWS_S3_PREFIX}/${uniqueName}-qr.png`;
+  await s3.send(new PutObjectCommand({
+    Bucket: AWS_S3_BUCKET,
+    Key: qrS3Key,
+    Body: qrBuffer,
+    ContentType: "image/png",
+    CacheControl: "public, max-age=31536000, immutable",
+  }));
+  meta.byFile[uniqueName].qrS3Key = qrS3Key;
+  meta.byToken[token].qrS3Key = qrS3Key;
+  writeMetadata(meta);
 
   // Respuesta visual
   res.send(`
@@ -219,13 +249,13 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
         <a href="/" style="display:inline-block; background:#28a745; color:white; text-decoration:none; padding:10px 16px; border-radius:6px;">➕ Subir otro PDF</a>
       </p>
       <p><strong>Archivo:</strong> ${file.originalname}</p>
-      <p><strong>Enlace válido hasta:</strong> ${expiresAt.toLocaleString()}</p>
+        <p><strong>Vencimiento:</strong> ${expiresAt ? expiresAt.toLocaleString() : 'Sin vencimiento'}</p>
       <p><strong>URL del documento:</strong> <a href="${viewUrl}" target="_blank">${viewUrl}</a></p>
 
-      <h3>Vista previa del QR</h3>
-      <img src="/files/${file.filename}-qr.png" alt="QR Code" width="300" style="border:1px solid #ccc; padding:10px; border-radius:10px"/><br/><br/>
+  <h3>Vista previa del QR</h3>
+  <img src="/qr/${encodeURIComponent(token)}" alt="QR Code" width="300" style="border:1px solid #ccc; padding:10px; border-radius:10px"/><br/><br/>
 
-      <a href="/files/${file.filename}-qr.png" download="qr-${file.originalname}.png">⬇️ Descargar QR (PNG)</a><br/><br/>
+  <a href="/qr/${encodeURIComponent(token)}?download=1">⬇️ Descargar QR (PNG)</a><br/><br/>
       <p>
         <a href="/delete/${encodeURIComponent(token)}" onclick="return confirm('¿Eliminar este PDF y su QR?');" style="color:#dc3545; font-weight:600;">🗑️ Eliminar este PDF</a>
       </p>
@@ -236,7 +266,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
 });
 
 // ✅ Ruta protegida por token y expiración: envía el PDF si el token sigue vigente
-app.get("/view/:token", (req, res) => {
+app.get("/view/:token", async (req, res) => {
   const token = req.params.token;
   const meta = readMetadata();
   const entry = meta.byToken[token];
@@ -256,9 +286,34 @@ app.get("/view/:token", (req, res) => {
       );
   }
 
+  if (entry.s3Bucket && entry.s3Key) {
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: entry.s3Bucket, Key: entry.s3Key }),
+      { expiresIn: 60 }
+    );
+    res.setHeader("Cache-Control", "no-store");
+    return res.redirect(url);
+  }
   const pdfPath = path.join(uploadDir, entry.filename);
   if (!fs.existsSync(pdfPath)) return res.status(404).send("❌ El archivo PDF ya no existe.");
   res.sendFile(pdfPath);
+});
+
+// QR desde S3 (URL prefirmada) para vista/descarga
+app.get("/qr/:token", async (req, res) => {
+  const token = req.params.token;
+  const meta = readMetadata();
+  const entry = meta.byToken[token];
+  if (!entry || !entry.qrS3Key || !entry.s3Bucket) return res.status(404).send("QR no encontrado");
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: entry.s3Bucket, Key: entry.qrS3Key }),
+    { expiresIn: 300 }
+  );
+  if (req.query.download) res.setHeader("Content-Disposition", `attachment; filename=qr-${encodeURIComponent(entry.originalName || entry.filename)}.png`);
+  res.setHeader("Cache-Control", "no-store");
+  return res.redirect(url);
 });
 
 // Listado simple de tokens guardados
@@ -271,18 +326,19 @@ function listTokens(req, res) {
   const meta = readMetadata();
   const rows = Object.entries(meta.byToken)
     .map(([t, info]) => {
-      const expired = info.expiresAt && Date.now() > Date.parse(info.expiresAt);
-      const qr = `${info.filename}-qr.png`;
+    const expired = info.expiresAt && Date.now() > Date.parse(info.expiresAt);
+    const qrRoute = `/qr/${t}`;
+    const expText = info.expiresAt ? new Date(info.expiresAt).toLocaleString() : 'Sin vencimiento';
       return `
         <tr>
           <td><code>${t}</code></td>
           <td>${info.originalName || "-"}</td>
           <td><code>${info.filename}</code></td>
           <td>${info.createdAt || "-"}</td>
-          <td>${info.expiresAt || "-"} ${expired ? "(vencido)" : ""}</td>
+      <td>${expText} ${expired ? "(vencido)" : ""}</td>
           <td>
             <a href="/view/${t}" target="_blank">Ver PDF</a> |
-            <a href="/files/${qr}" target="_blank">Ver QR</a> |
+            <a href="${qrRoute}" target="_blank">Ver QR</a> |
             <a href="/delete/${encodeURIComponent(t)}" style="color:#dc3545" onclick="return confirm('¿Eliminar este PDF y su QR?');">Eliminar</a>
           </td>
         </tr>`;
@@ -312,15 +368,17 @@ function listTokens(req, res) {
 }
 
 // Limpieza de elementos vencidos
-function purgeExpired() {
+async function purgeExpired() {
   const meta = readMetadata();
   const now = Date.now();
   let removed = 0;
   for (const [token, info] of Object.entries(meta.byToken)) {
     const exp = Date.parse(info.expiresAt || "");
     if (Number.isFinite(exp) && now > exp) {
-      try { fs.unlinkSync(path.join(uploadDir, info.filename)); } catch {}
-      try { fs.unlinkSync(path.join(uploadDir, `${info.filename}-qr.png`)); } catch {}
+  try { if (info.s3Bucket && info.s3Key) await s3.send(new DeleteObjectCommand({ Bucket: info.s3Bucket, Key: info.s3Key })); } catch {}
+  try { if (info.s3Bucket && info.qrS3Key) await s3.send(new DeleteObjectCommand({ Bucket: info.s3Bucket, Key: info.qrS3Key })); } catch {}
+  try { fs.unlinkSync(path.join(uploadDir, info.filename)); } catch {}
+  try { fs.unlinkSync(path.join(uploadDir, `${info.filename}-qr.png`)); } catch {}
       delete meta.byFile[info.filename];
       delete meta.byToken[token];
       removed++;
@@ -331,8 +389,8 @@ function purgeExpired() {
 }
 
 // Endpoint para ejecutar limpieza manual
-app.get("/admin/purge", requireAdmin, (req, res) => {
-  const removed = purgeExpired();
+app.get("/admin/purge", requireAdmin, async (req, res) => {
+  const removed = await purgeExpired();
   res.send(`Eliminados ${removed} elementos vencidos. <a href=\"/manage\">Volver</a>`);
 });
 
@@ -346,10 +404,9 @@ app.use((err, req, res, next) => {
   res.status(400).send(err?.message || "Error en la solicitud");
 });
 // Ejecutar limpieza al iniciar
-try {
-  const removed = purgeExpired();
+purgeExpired().then((removed) => {
   if (removed) console.log(`🧹 Purga inicial: ${removed} elemento(s) vencido(s) eliminado(s).`);
-} catch {}
+}).catch(() => {});
 
 
 // Página de administración con lista sencilla y opción de eliminar
@@ -358,13 +415,13 @@ app.get("/manage", requireAdmin, (req, res) => {
   const items = Object.entries(meta.byToken)
     .sort((a, b) => Date.parse(b[1].createdAt) - Date.parse(a[1].createdAt))
     .map(([t, info]) => {
-      const created = new Date(info.createdAt).toLocaleString();
-      const sizeStr = ""; // tamaño no persistido, opcional
+  const created = new Date(info.createdAt).toLocaleString();
+  const sizeStr = info.size ? ` (${(info.size/1024).toFixed(1)} KB)` : "";
       return `
         <tr>
           <td>${info.originalName || info.filename}</td>
-          <td>${created}</td>
-          <td><a href="/view/${t}" target="_blank">PDF</a> | <a href="/files/${info.filename}-qr.png" target="_blank">QR</a></td>
+          <td>${created}${sizeStr}</td>
+          <td><a href="/view/${t}" target="_blank">PDF</a> | <a href="/qr/${t}" target="_blank">QR</a></td>
           <td><a href="/delete/${encodeURIComponent(t)}" style="color:#dc3545" onclick="return confirm('¿Eliminar ${info.originalName || info.filename}?');">Eliminar</a></td>
         </tr>`;
     })
@@ -388,9 +445,9 @@ app.get("/manage", requireAdmin, (req, res) => {
 });
 
 // Eliminar por token
-app.get("/delete/:token", requireAdmin, (req, res) => {
+app.get("/delete/:token", requireAdmin, async (req, res) => {
   const token = req.params.token;
-  const result = removeByToken(token);
+  const result = await removeByToken(token);
   if (!result.ok) return res.status(404).send("Archivo no encontrado o ya eliminado.");
   res.redirect("/manage");
 });
@@ -414,7 +471,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // Purga periódica de vencidos
-setInterval(() => {
-  const removed = purgeExpired();
+setInterval(async () => {
+  const removed = await purgeExpired();
   if (removed) console.log(`🧹 Purga periódica: ${removed} elemento(s) vencido(s).`);
 }, Math.max(1, PURGE_INTERVAL_MINUTES) * 60 * 1000).unref();
